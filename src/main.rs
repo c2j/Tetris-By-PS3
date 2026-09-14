@@ -39,10 +39,10 @@ struct PollFd { fd: i32, events: i16, revents: i16 }
 const TERMIOS_LEN: usize = 64;
 const LFLAG_OFF: usize = 12;
 const CC_OFF: usize = 17;
-const VTIME: usize = 5;
-const VMIN: usize = 6;
-const ISIG: u32 = 0x1;
-const ICANON: u32 = 0x2;
+const VTIME: usize = 7;
+const VMIN: usize = 5;
+const ISIG: u32 = 0x80;
+const ICANON: u32 = 0x100;
 const ECHO: u32 = 0x8;
 const TCSANOW: i32 = 0;
 
