@@ -22,7 +22,7 @@ const PIECES: [&[[(i8, i8); 4]]; 7] = [
 const COLORS: [u8; 7] = [96, 93, 95, 94, 33, 92, 91]; // ansi fg colors per piece
 
 struct TermRaw {
-    orig: [u8; 32],
+    orig: Vec<u8>,
 }
 
 extern "C" {
@@ -34,24 +34,35 @@ extern "C" {
 #[repr(C)]
 struct PollFd { fd: i32, events: i16, revents: i16 }
 
+// Linux termios: iflag, oflag, cflag, lflag (u32 each), line (u8), cc[32],
+// plus c_ispeed/c_ospeed (u32 each) = 57 bytes, padded to 60. Use 64 to be safe.
+const TERMIOS_LEN: usize = 64;
+const LFLAG_OFF: usize = 12;
+const CC_OFF: usize = 17;
+const VTIME: usize = 5;
+const VMIN: usize = 6;
+const ISIG: u32 = 0x1;
+const ICANON: u32 = 0x2;
+const ECHO: u32 = 0x8;
+const TCSANOW: i32 = 0;
+
+fn get_word(t: &[u8], off: usize) -> u32 {
+    u32::from_ne_bytes([t[off], t[off + 1], t[off + 2], t[off + 3]])
+}
+
 impl TermRaw {
     fn new() -> TermRaw {
-        let mut t = [0u8; 32];
+        let mut t = vec![0u8; TERMIOS_LEN];
         unsafe {
-            tcgetattr(0, t.as_mut_ptr());
-            let orig = t;
-            // c_iflag=0, c_oflag=1, c_cflag=2, c_lflag=3 as u32 LE indices
-            let lflag_off = 3 * 4;
-            let lflag = u32::from_ne_bytes([t[lflag_off], t[lflag_off+1], t[lflag_off+2], t[lflag_off+3]]);
-            let new = lflag & !(0x8 /*ECHO*/ | 0x2 /*ICANON*/ | 0x1 /*ISIG*/);
-            t[lflag_off..lflag_off+4].copy_from_slice(&new.to_ne_bytes());
-             // offsets
-            // Linux termios: cc array starts at offset 3*4? Actually: c_iflag,c_oflag,c_cflag,c_lflag (u32 each), c_line (u8), c_cc[32]
-            // cc offset:
-            let cc = 16 + 1;
-            t[cc + 6] = 1; // VMIN
-            t[cc + 5] = 0; // VTIME
-            tcsetattr(0, 0 /*TCSANOW*/, t.as_ptr());
+            if tcgetattr(0, t.as_mut_ptr()) != 0 {
+                eprintln!("tcgetattr failed");
+            }
+            let orig = t.clone();
+            let lflag = get_word(&t, LFLAG_OFF) & !(ISIG | ICANON | ECHO);
+            t[LFLAG_OFF..LFLAG_OFF + 4].copy_from_slice(&lflag.to_ne_bytes());
+            t[CC_OFF + VMIN] = 1;
+            t[CC_OFF + VTIME] = 0;
+            tcsetattr(0, TCSANOW, t.as_ptr());
             TermRaw { orig }
         }
     }
@@ -59,7 +70,7 @@ impl TermRaw {
 
 impl Drop for TermRaw {
     fn drop(&mut self) {
-        unsafe { tcsetattr(0, 0, self.orig.as_ptr()); }
+        unsafe { tcsetattr(0, TCSANOW, self.orig.as_ptr()); }
     }
 }
 
@@ -221,13 +232,13 @@ impl Game {
     fn render(&self, paused: bool) -> String {
         let mut out = String::with_capacity(8192);
         out.push_str("\x1b[H\x1b[2J");
-        let title = if paused { "  П А У З А  " } else { "  ТЕТРИС  " };
+        let title = if paused { "  PA3A (pause)  " } else { "  TETRIS  " };
         out.push_str(&format!("\x1b[1;97m=====\x1b[0m{} \x1b[1;97m=====\x1b[0m\r\n\r\n", title));
         // board frame
-        out.push_str("\x1b[90m┌────────────┐  \x1b[0m\r\n");
+        out.push_str("\x1b[90m+------------+  \x1b[0m\r\n");
         let cells = self.cur.cells();
         for y in 0..H {
-            out.push_str("\x1b[90m│\x1b[0m");
+            out.push_str("\x1b[90m|\x1b[0m");
             for x in 0..W {
                 let mut k = self.board[y][x];
                 if !paused {
@@ -238,40 +249,40 @@ impl Game {
                 if k == 0 {
                     out.push_str("  ");
                 } else {
-                    out.push_str(&format!("\x1b[{}m██\x1b[0m", COLORS[(k - 1) as usize]));
+                    out.push_str(&format!("\x1b[{}m[]\x1b[0m", COLORS[(k - 1) as usize]));
                 }
             }
-            out.push_str("\x1b[90m│\x1b[0m");
+            out.push_str("\x1b[90m|\x1b[0m");
             // side info on some rows
             match y {
-                1 => out.push_str("  Следующая:"),
+                1 => out.push_str("  Next:"),
                 2..=4 => {
                     let nk = self.next;
                     let dy = y as i8 - 2;
                     out.push_str("  ");
                     for dx in 0..5i8 {
                         if PIECES[nk][0].iter().any(|&(px, py)| px == dx && py == dy) {
-                            out.push_str(&format!("\x1b[{}m██\x1b[0m", COLORS[nk]));
+                            out.push_str(&format!("\x1b[{}m[]\x1b[0m", COLORS[nk]));
                         } else { out.push_str("  "); }
                     }
                 }
-                6 => out.push_str(&format!("  Счёт: {}", self.score)),
-                7 => out.push_str(&format!("  Линии: {}", self.lines)),
-                8 => out.push_str(&format!("  Уровень: {}", self.level)),
+                6 => out.push_str(&format!("  Score: {}", self.score)),
+                7 => out.push_str(&format!("  Lines: {}", self.lines)),
+                8 => out.push_str(&format!("  Level: {}", self.level)),
                 10 => if let Some(h) = self.hold {
-                    out.push_str(&format!("  Хранится: \x1b[{}m██\x1b[0m", COLORS[h]));
+                    out.push_str(&format!("  Hold: \x1b[{}m[]\x1b[0m", COLORS[h]));
                 },
-                15 => out.push_str("  ← → двигать"),
-                16 => out.push_str("  ↑ поворот, ↓ вниз"),
-                17 => out.push_str("  C держать, P пауза"),
-                18 => out.push_str("  Q выход"),
+                15 => out.push_str("  <- -> move"),
+                16 => out.push_str("  up rotate, down soft-drop"),
+                17 => out.push_str("  C hold, P pause"),
+                18 => out.push_str("  Q quit"),
                 _ => {}
             }
             out.push_str("\r\n");
         }
-        out.push_str("\x1b[90m└────────────┘\x1b[0m\r\n");
+        out.push_str("\x1b[90m+------------+\x1b[0m\r\n");
         if self.over {
-            out.push_str(&format!("\r\n\x1b[1;91m ИГРА ОКОНЧЕНА!\x1b[0m Счёт: {}. Enter — заново, Q — выход\r\n", self.score));
+            out.push_str(&format!("\r\n\x1b[1;91m GAME OVER!\x1b[0m Score: {}. Enter = restart, Q = quit\r\n", self.score));
         }
         out
     }
@@ -330,5 +341,5 @@ fn main() {
     }
     write!(out, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H").unwrap();
     out.flush().unwrap();
-    println!("Спасибо за игру! Счёт: {}", g.score);
+    println!("Thanks for playing! Score: {}", g.score);
 }
