@@ -254,10 +254,8 @@ impl Game {
             out.push_str("\x1b[90m|\x1b[0m");
             for x in 0..W {
                 let mut k = self.board[y][x];
-                if !paused {
-                    if cells.iter().any(|&(cx, cy)| cy as usize == y && cx as usize == x) {
-                        k = (self.cur.kind + 1) as u8;
-                    }
+                if cells.iter().any(|&(cx, cy)| cy as usize == y && cx as usize == x) {
+                    k = (self.cur.kind + 1) as u8;
                 }
                 if k == 0 {
                     out.push_str("  ");
