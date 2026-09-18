@@ -244,7 +244,7 @@ impl Game {
 
     fn render(&self, paused: bool) -> String {
         let mut out = String::with_capacity(8192);
-        out.push_str("\x1b[H\x1b[2J");
+        out.push_str("\x1b[H"); // move home and overwrite; \x1b[2J each frame causes flicker
         let title = if paused { "  PA3A (pause)  " } else { "  TETRIS  " };
         out.push_str(&format!("\x1b[1;97m=====\x1b[0m{} \x1b[1;97m=====\x1b[0m\r\n\r\n", title));
         // board frame
@@ -291,9 +291,10 @@ impl Game {
                 18 => out.push_str("  Q quit"),
                 _ => {}
             }
-            out.push_str("\r\n");
+            out.push_str("\x1b[K\r\n"); // clear rest of line
         }
         out.push_str("\x1b[90m+------------+\x1b[0m\r\n");
+        out.push_str("\x1b[K"); // clear any leftover game-over text
         if self.over {
             out.push_str(&format!("\r\n\x1b[1;91m GAME OVER!\x1b[0m Score: {}. Enter = restart, Q = quit\r\n", self.score));
         }
