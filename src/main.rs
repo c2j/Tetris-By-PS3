@@ -2,7 +2,7 @@
 // Build: cargo build --release && ./target/release/tetris
 // Keys: a/d or h/l = move, w or space = rotate, s = soft drop,
 //       q = quit, p = pause, c = hold. Enter to start/restart.
-use std::io::{Read, Write};
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 const W: usize = 10;
@@ -29,6 +29,7 @@ extern "C" {
     fn tcgetattr(fd: i32, termios: *mut u8) -> i32;
     fn tcsetattr(fd: i32, act: i32, termios: *const u8) -> i32;
     fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
 }
 
 #[repr(C)]
@@ -74,29 +75,41 @@ impl Drop for TermRaw {
     }
 }
 
-fn wait_input(ms: i32) -> Option<u8> {
+// Pending input bytes already read from fd 0 but not yet consumed.
+// Must bypass std::io::stdin(): its internal buffer swallows the trailing
+// bytes of an escape sequence, where poll() on the fd can no longer see them.
+fn wait_input(q: &mut Vec<u8>, ms: i32) -> Option<u8> {
+    if !q.is_empty() { return Some(q.remove(0)); }
     let mut fds = [PollFd { fd: 0, events: 1, revents: 0 }];
     let r = unsafe { poll(fds.as_mut_ptr(), 1, ms) };
     if r <= 0 { return None; }
-    let mut b = [0u8; 1];
-    if std::io::stdin().read(&mut b).unwrap() == 0 { return None; }
-    Some(b[0])
+    let mut b = [0u8; 64];
+    let n = unsafe { read(0, b.as_mut_ptr(), b.len()) };
+    if n <= 0 { return None; }
+    let n = n as usize;
+    q.extend_from_slice(&b[..n]);
+    Some(q.remove(0))
 }
 
 // returns Some(extended key) for escape sequences like arrows
-fn read_key(ms: i32) -> Option<Key> {
-    let b = wait_input(ms)?;
+fn read_key(q: &mut Vec<u8>, ms: i32) -> Option<Key> {
+    let b = wait_input(q, ms)?;
     match b {
         b'\x1b' => {
-            // try read sequence
-            match wait_input(0) {
-                Some(b'[') => match wait_input(0) {
-                    Some(b'A') => Some(Key::Up),
-                    Some(b'B') => Some(Key::Down),
-                    Some(b'C') => Some(Key::Right),
-                    Some(b'D') => Some(Key::Left),
-                    _ => Some(Key::Other),
-                },
+            // An arrow arrives as a 3-byte burst (ESC [ X). Read whatever is
+            // already buffered plus wait briefly for stragglers, then decode.
+            let mut seq = Vec::new();
+            for _ in 0..2 {
+                match wait_input(q, 20) {
+                    Some(b) => seq.push(b),
+                    None => break,
+                }
+            }
+            match seq.as_slice() {
+                [b'[', b'A'] | [b'O', b'A'] => Some(Key::Up),
+                [b'[', b'B'] | [b'O', b'B'] => Some(Key::Down),
+                [b'[', b'C'] | [b'O', b'C'] => Some(Key::Right),
+                [b'[', b'D'] | [b'O', b'D'] => Some(Key::Left),
                 _ => Some(Key::Other),
             }
         }
@@ -298,6 +311,7 @@ fn main() {
     let mut g = Game::new();
     let mut paused = false;
     let mut last = Instant::now();
+    let mut inq: Vec<u8> = Vec::new();
 
     write!(out, "\x1b[?25l").unwrap();
     out.flush().unwrap();
@@ -306,7 +320,7 @@ fn main() {
         if g.over {
             write!(out, "{}", g.render(false)).unwrap();
             out.flush().unwrap();
-            match read_key(200) {
+            match read_key(&mut inq, 200) {
                 Some(Key::Quit) => break,
                 Some(Key::Other) => { g = Game::new(); }
                 _ => {}
@@ -317,7 +331,7 @@ fn main() {
         // input handling
         let elapsed = last.elapsed();
         let remain = interval.saturating_sub(elapsed);
-        match read_key(remain.as_millis().min(100) as i32) {
+        match read_key(&mut inq, remain.as_millis().min(100) as i32) {
             Some(Key::Quit) => break,
             Some(Key::Pause) => paused = !paused,
             Some(Key::Left) => if !paused { g.move_(-1, 0); },
