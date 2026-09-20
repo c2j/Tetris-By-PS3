@@ -8,10 +8,10 @@ This game was created entirely by an AI coding agent, from first commit to the
 keyboard, rendering, and gameplay fixes. The human described what they wanted
 and reported bugs; the agent wrote and debugged all the code.
 
-- **Coding agent**: [Jcode](https://github.com/1jehuang/jcode) (open-source
-  terminal coding agent), running interactively in the PS3 Linux console.
-- **LLM**: the agent was driven by an OpenAI large language model (GPT-5
-  family) via the OpenAI API.
+- **Coding agent**: [Jcode](https://github.com/1jehuang/jcode), a tiny
+  open-source terminal coding agent, running interactively in the PS3 Linux
+  console.
+- **LLM**: the agent was driven by GLM 5.3 (Zhipu AI) via its API.
 - **Human role**: project idea, testing on real hardware, and bug reports
   (e.g. keyboard not responding, arrow keys inverted, pause screen flicker),
   which the agent diagnosed and fixed in a closed loop using automated
