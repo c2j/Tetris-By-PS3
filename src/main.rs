@@ -4,10 +4,10 @@
 use std::io::Write;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const W: usize = 10;
-const H: usize = 20;
+const W: i8 = 10;
+const H: i8 = 20;
 
-// Each piece: rotations, each a set of (x,y) cells.
+// Piece rotations as (x,y) cells.
 const PIECES: [&[[(i8, i8); 4]]; 7] = [
     &[[(0,0),(1,0),(2,0),(3,0)], [(2,0),(2,1),(2,2),(2,3)], [(0,2),(1,2),(2,2),(3,2)], [(0,0),(0,1),(0,2),(0,3)]], // I
     &[[(0,0),(1,0),(0,1),(1,1)]], // O
@@ -17,22 +17,18 @@ const PIECES: [&[[(i8, i8); 4]]; 7] = [
     &[[(1,0),(2,0),(0,1),(1,1)], [(1,0),(1,1),(2,1),(2,2)]], // S
     &[[(0,0),(1,0),(1,1),(2,1)], [(2,0),(1,1),(2,1),(1,2)]], // Z
 ];
-const COLORS: [u8; 7] = [96, 93, 95, 94, 33, 92, 91]; // ansi fg per piece
+const COLORS: [&str; 7] = ["\x1b[96m", "\x1b[93m", "\x1b[95m", "\x1b[94m", "\x1b[33m", "\x1b[92m", "\x1b[91m"];
 
 extern "C" {
-    fn tcgetattr(fd: i32, termios: *mut u8) -> i32;
-    fn tcsetattr(fd: i32, act: i32, termios: *const u8) -> i32;
-    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
-    fn read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn tcgetattr(fd: i32, t: *mut u8) -> i32;
+    fn tcsetattr(fd: i32, act: i32, t: *const u8) -> i32;
+    fn poll(f: *mut PollFd, n: u64, ms: i32) -> i32;
+    fn read(fd: i32, b: *mut u8, n: usize) -> isize;
 }
 #[repr(C)]
 struct PollFd { fd: i32, events: i16, revents: i16 }
 
-// PowerPC Linux termios: iflag/oflag/cflag/lflag u32 @0/4/8/12, cc[] @17.
-// VMIN=5, VTIME=7, ISIG=0x80, ICANON=0x100, ECHO=0x8 (ppc values, NOT x86!).
-const LFLAG_OFF: usize = 12;
-const CC_OFF: usize = 17;
-
+// ppc Linux termios: lflag u32 @12 (big-endian), cc @17. ISIG=0x80 ICANON=0x100 ECHO=0x8.
 struct TermRaw { orig: [u8; 64] }
 impl TermRaw {
     fn new() -> TermRaw {
@@ -40,11 +36,10 @@ impl TermRaw {
         unsafe {
             tcgetattr(0, t.as_mut_ptr());
             let orig = t;
-            let lflag = u32::from_ne_bytes(t[LFLAG_OFF..LFLAG_OFF + 4].try_into().unwrap())
-                & !(0x80 | 0x100 | 0x8); // clear ISIG, ICANON, ECHO (ppc values)
-            t[LFLAG_OFF..LFLAG_OFF + 4].copy_from_slice(&lflag.to_ne_bytes());
-            t[CC_OFF + 5] = 1; // VMIN
-            t[CC_OFF + 7] = 0; // VTIME
+            let l = u32::from_be_bytes(t[12..16].try_into().unwrap()) & !0x188;
+            t[12..16].copy_from_slice(&l.to_be_bytes());
+            t[22] = 1; // VMIN
+            t[24] = 0; // VTIME
             tcsetattr(0, 0, t.as_ptr());
             TermRaw { orig }
         }
@@ -54,14 +49,14 @@ impl Drop for TermRaw {
     fn drop(&mut self) { unsafe { tcsetattr(0, 0, self.orig.as_ptr()); } }
 }
 
-// Input byte queue: must bypass std::io::stdin(), whose buffer swallows the
-// trailing bytes of arrow-key escape sequences that poll() can no longer see.
-fn wait_input(q: &mut Vec<u8>, ms: i32) -> Option<u8> {
+// Byte queue fed by poll/read: std::io::stdin()'s buffer would swallow escape
+// sequence tails that poll() on fd 0 could never see again.
+fn getc(q: &mut Vec<u8>, ms: i32) -> Option<u8> {
     if q.is_empty() {
-        let mut fds = [PollFd { fd: 0, events: 1, revents: 0 }];
-        if unsafe { poll(fds.as_mut_ptr(), 1, ms) } <= 0 { return None; }
+        let mut f = [PollFd { fd: 0, events: 1, revents: 0 }];
+        if unsafe { poll(f.as_mut_ptr(), 1, ms) } <= 0 { return None; }
         let mut b = [0u8; 64];
-        let n = unsafe { read(0, b.as_mut_ptr(), b.len()) };
+        let n = unsafe { read(0, b.as_mut_ptr(), 64) };
         if n <= 0 { return None; }
         q.extend_from_slice(&b[..n as usize]);
     }
@@ -69,63 +64,51 @@ fn wait_input(q: &mut Vec<u8>, ms: i32) -> Option<u8> {
 }
 
 #[derive(PartialEq)]
-enum Key { Left, Right, Down, Up, Quit, Pause, Hold, Other }
+enum Key { L, R, D, U, Quit, Pause, Hold, Other }
 
-fn read_key(q: &mut Vec<u8>, ms: i32) -> Option<Key> {
-    let b = wait_input(q, ms)?;
-    let k = match b {
-        b'\x1b' => {
-            // Arrow arrives as a 3-byte burst (ESC [ X); collect and decode.
-            let s: Vec<u8> = (0..2).filter_map(|_| wait_input(q, 20)).collect();
-            match s.as_slice() {
-                [b'[', x] | [b'O', x] => match x {
-                    b'A' => Key::Up, b'B' => Key::Down, b'C' => Key::Right, b'D' => Key::Left,
-                    _ => Key::Other,
-                },
-                _ => Key::Other,
-            }
-        }
-        b'a' | b'h' | b'A' | b'H' => Key::Left,
-        b'd' | b'l' | b'D' | b'L' => Key::Right,
-        b's' | b'S' | b'j' | b'J' => Key::Down,
-        b'w' | b'W' | b' ' | b'k' | b'K' => Key::Up,
+fn key(q: &mut Vec<u8>, ms: i32) -> Option<Key> {
+    Some(match getc(q, ms)? {
+        b'\x1b' => match [getc(q, 20), getc(q, 20)] { // arrows: ESC [ X
+            [Some(b'['), Some(x)] | [Some(b'O'), Some(x)] => match x {
+                b'A' => Key::U, b'B' => Key::D, b'C' => Key::R, b'D' => Key::L, _ => Key::Other },
+            _ => Key::Other,
+        },
+        b'a' | b'h' | b'A' | b'H' => Key::L,
+        b'd' | b'l' | b'D' | b'L' => Key::R,
+        b's' | b'S' | b'j' | b'J' => Key::D,
+        b'w' | b'W' | b' ' | b'k' | b'K' => Key::U,
         b'q' | b'Q' | 3 => Key::Quit,
         b'p' | b'P' => Key::Pause,
         b'c' | b'C' => Key::Hold,
         _ => Key::Other,
-    };
-    Some(k)
+    })
 }
 
 #[derive(Clone)]
-struct Piece { kind: usize, rot: usize, x: i8, y: i8 }
-impl Piece {
-    fn new(kind: usize) -> Piece { Piece { kind, rot: 0, x: 3, y: 0 } }
+struct P { k: usize, r: usize, x: i8, y: i8 }
+impl P {
+    fn new(k: usize) -> P { P { k, r: 0, x: 3, y: 0 } }
     fn cells(&self) -> [(i8, i8); 4] {
-        let mut c = PIECES[self.kind][self.rot];
+        let mut c = PIECES[self.k][self.r];
         for p in c.iter_mut() { p.0 += self.x; p.1 += self.y; }
         c
     }
 }
 
-struct Game {
-    board: [[u8; W]; H], cur: Piece, next: usize,
-    hold: Option<usize>, hold_used: bool,
+struct G {
+    b: [[u8; W as usize]; H as usize], cur: P, next: usize,
+    hold: Option<usize>, held: bool,
     score: u32, lines: u32, level: u32, over: bool, bag: Vec<usize>,
 }
-
-impl Game {
-    fn new() -> Game {
-        let mut g = Game {
-            board: [[0; W]; H], cur: Piece::new(0), next: 0, hold: None, hold_used: false,
-            score: 0, lines: 0, level: 1, over: false, bag: Vec::new(),
-        };
-        g.cur = Piece::new(g.draw());
+impl G {
+    fn new() -> G {
+        let mut g = G { b: [[0; 10]; 20], cur: P::new(0), next: 0, hold: None, held: false,
+            score: 0, lines: 0, level: 1, over: false, bag: Vec::new() };
+        g.cur = P::new(g.draw());
         g.next = g.draw();
         g
     }
-    // 7-bag randomizer, seeded by the clock
-    fn draw(&mut self) -> usize {
+    fn draw(&mut self) -> usize { // 7-bag, clock-shuffled
         if self.bag.is_empty() {
             self.bag = (0..7).collect();
             for i in (1..7).rev() {
@@ -136,21 +119,19 @@ impl Game {
         }
         self.bag.pop().unwrap()
     }
-    fn fits(&self, p: &Piece) -> bool {
-        p.cells().iter().all(|&(x, y)| {
-            x >= 0 && x < W as i8 && y < H as i8
-                && (y < 0 || self.board[y as usize][x as usize] == 0)
-        })
+    fn fits(&self, p: &P) -> bool {
+        p.cells().iter().all(|&(x, y)|
+            x >= 0 && x < W && y < H && (y < 0 || self.b[y as usize][x as usize] == 0))
     }
-    fn move_(&mut self, dx: i8, dy: i8) -> bool {
+    fn mv(&mut self, dx: i8, dy: i8) -> bool {
         let mut p = self.cur.clone();
         p.x += dx; p.y += dy;
         if self.fits(&p) { self.cur = p; true } else { false }
     }
-    fn rotate(&mut self) {
+    fn rot(&mut self) {
         let mut p = self.cur.clone();
-        p.rot = (p.rot + 1) % PIECES[p.kind].len();
-        for k in [0i8, -1, 1, -2, 2] { // simple wall kicks
+        p.r = (p.r + 1) % PIECES[p.k].len();
+        for k in [0i8, -1, 1, -2, 2] { // wall kicks
             p.x += k;
             if self.fits(&p) { self.cur = p; return; }
             p.x -= k;
@@ -158,134 +139,123 @@ impl Game {
     }
     fn lock(&mut self) {
         for &(x, y) in self.cur.cells().iter() {
-            if y >= 0 { self.board[y as usize][x as usize] = (self.cur.kind + 1) as u8; }
+            if y >= 0 { self.b[y as usize][x as usize] = self.cur.k as u8 + 1; }
         }
-        let mut cleared = 0;
+        let mut n = 0;
         let mut y = H;
         while y > 0 {
             y -= 1;
-            if self.board[y].iter().all(|&c| c != 0) {
-                cleared += 1;
-                self.board[..=y].rotate_right(1);
-                self.board[0] = [0; W];
+            if self.b[y as usize].iter().all(|&c| c != 0) {
+                n += 1;
+                self.b[..=y as usize].rotate_right(1);
+                self.b[0] = [0; 10];
             }
         }
-        if cleared > 0 {
-            self.lines += cleared;
-            self.score += [0u32, 100, 300, 500, 800][cleared as usize] * self.level;
+        if n > 0 {
+            self.lines += n;
+            self.score += [0, 100, 300, 500, 800][n as usize] * self.level;
             self.level = 1 + self.lines / 10;
         }
-        self.cur = Piece::new(self.next);
+        self.cur = P::new(self.next);
         self.next = self.draw();
-        self.hold_used = false;
-        self.over = self.cur.cells().iter().any(|&(_, y)| y < 0) || !self.fits(&self.cur);
+        self.held = false;
+        self.over = !self.fits(&self.cur);
     }
     fn hold(&mut self) {
-        if self.hold_used { return; }
-        self.hold_used = true;
-        let k = self.cur.kind;
-        self.cur = match self.hold.take() {
-            Some(h) => Piece::new(h),
-            None => { let n = self.next; self.next = self.draw(); Piece::new(n) }
-        };
-        self.hold = Some(k);
+        if !self.held {
+            self.held = true;
+            let k = self.cur.k;
+            self.cur = match self.hold.take() {
+                Some(h) => P::new(h),
+                None => { let n = self.next; self.next = self.draw(); P::new(n) }
+            };
+            self.hold = Some(k);
+        }
     }
-    fn piece_at(&self, x: usize, y: usize) -> u8 {
-        let k = (self.cur.kind + 1) as u8;
-        if self.cur.cells().iter().any(|&(cx, cy)| cx as usize == x && cy as usize == y) { k }
-        else { self.board[y][x] }
+    fn at(&self, x: i8, y: i8) -> u8 {
+        let k = self.cur.k as u8 + 1;
+        if self.cur.cells().iter().any(|&(a, b)| a == x && b == y) { k } else { self.b[y as usize][x as usize] }
     }
     fn render(&self, paused: bool) -> String {
-        let title = if paused { "  PA3A (pause)  " } else { "  TETRIS  " };
-        let mut out = format!("\x1b[H\x1b[1;97m=====\x1b[0m{} \x1b[1;97m=====\x1b[0m\r\n\r\n\x1b[90m+------------+  \x1b[0m\r\n", title);
+        let mut o = format!("\x1b[H\x1b[1;97m=====\x1b[0m {} \x1b[1;97m=====\x1b[0m\r\n\r\n\x1b[90m+------------+\x1b[0m\r\n",
+            if paused { "PA3A" } else { "TETRIS" });
         for y in 0..H {
-            out.push_str("\x1b[90m|\x1b[0m");
+            o.push_str("\x1b[90m|\x1b[0m");
             for x in 0..W {
-                let k = self.piece_at(x, y);
-                if k == 0 { out.push_str("  "); }
-                else { out.push_str(&format!("\x1b[{}m[]\x1b[0m", COLORS[(k - 1) as usize])); }
+                let k = self.at(x, y);
+                if k == 0 { o.push_str("  ") } else { o.push_str(COLORS[k as usize - 1]); o.push_str("[]\x1b[0m"); }
             }
-            out.push_str("\x1b[90m|\x1b[0m");
+            o.push_str("\x1b[90m|\x1b[0m");
             match y { // side info
-                1 => out.push_str("  Next:"),
-                2..=4 => for dx in 0..5i8 {
-                    let dy = y as i8 - 2;
-                    if PIECES[self.next][0].iter().any(|&(px, py)| px == dx && py == dy) {
-                        out.push_str(&format!("\x1b[{}m[]\x1b[0m", COLORS[self.next]));
-                    } else { out.push_str("  "); }
+                1 => o.push_str(" Next:"),
+                2..=4 => for x in 0..5 {
+                    let dy = y - 2;
+                    if PIECES[self.next][0].iter().any(|&(a, b)| a == x && b == dy) {
+                        o.push_str(COLORS[self.next]); o.push_str("[]\x1b[0m");
+                    } else { o.push_str("  "); }
                 },
-                6 => out.push_str(&format!("  Score: {}", self.score)),
-                7 => out.push_str(&format!("  Lines: {}", self.lines)),
-                8 => out.push_str(&format!("  Level: {}", self.level)),
-                10 => if let Some(h) = self.hold {
-                    out.push_str(&format!("  Hold: \x1b[{}m[]\x1b[0m", COLORS[h]));
-                },
-                15 => out.push_str("  <- -> move"),
-                16 => out.push_str("  up rotate, down soft-drop"),
-                17 => out.push_str("  C hold, P pause"),
-                18 => out.push_str("  Q quit"),
+                6 => o.push_str(&format!(" Score:{}", self.score)),
+                7 => o.push_str(&format!(" Lines:{}", self.lines)),
+                8 => o.push_str(&format!(" Level:{}", self.level)),
+                10 => if let Some(h) = self.hold { o.push_str(&format!(" Hold:{}[]\x1b[0m", COLORS[h])); },
+                15 => o.push_str(" <- -> move"),
+                16 => o.push_str(" up=rotate, down=drop"),
+                17 => o.push_str(" C=hold, P=pause, Q=quit"),
                 _ => {}
             }
-            out.push_str("\x1b[K\r\n");
+            o.push_str("\x1b[K\r\n");
         }
-        out.push_str("\x1b[90m+------------+\x1b[0m\r\n\x1b[K");
-        if self.over {
-            out.push_str(&format!("\r\n\x1b[1;91m GAME OVER!\x1b[0m Score: {}. Enter = restart, Q = quit\r\n", self.score));
-        }
-        out
+        o.push_str("\x1b[90m+------------+\x1b[0m\r\n\x1b[K");
+        if self.over { o.push_str(&format!("\r\n\x1b[1;91mGAME OVER!\x1b[0m Score:{}. Any key=restart, Q=quit\r\n", self.score)); }
+        o
     }
 }
 
 fn main() {
     let _raw = TermRaw::new();
-    let mut out = std::io::stdout();
-    let mut g = Game::new();
+    let mut o = std::io::stdout();
+    let mut g = G::new();
     let mut paused = false;
     let mut last = Instant::now();
-    let mut inq = Vec::new();
-
-    write!(out, "\x1b[?25l").unwrap();
-    out.flush().unwrap();
+    let mut q = Vec::new();
+    write!(o, "\x1b[?25l").unwrap();
 
     loop {
         if g.over {
-            write!(out, "{}", g.render(false)).unwrap();
-            out.flush().unwrap();
-            match read_key(&mut inq, 200) {
+            write!(o, "{}", g.render(false)).unwrap();
+            o.flush().unwrap();
+            match key(&mut q, 200) {
                 Some(Key::Quit) => break,
-                Some(Key::Other) => g = Game::new(),
+                Some(Key::Other) => g = G::new(),
                 _ => {}
             }
             continue;
         }
-        let interval = Duration::from_millis((800u64.saturating_sub((g.level as u64 - 1) * 70)).max(80));
-        let remain = interval.saturating_sub(last.elapsed()).as_millis().min(100) as i32;
-        match read_key(&mut inq, remain) {
+        let dt = Duration::from_millis((800u64.saturating_sub((g.level as u64 - 1) * 70)).max(80));
+        let wait = dt.saturating_sub(last.elapsed()).as_millis().min(100) as i32;
+        match key(&mut q, wait) {
             Some(Key::Quit) => break,
             Some(Key::Pause) => paused = !paused,
             Some(k) if !paused => match k {
-                Key::Left => { g.move_(-1, 0); },
-                Key::Right => { g.move_(1, 0); },
-                Key::Down => { if !g.move_(0, 1) { g.lock(); } g.score += 1; },
-                Key::Up => g.rotate(),
+                Key::L => { g.mv(-1, 0); }
+                Key::R => { g.mv(1, 0); }
+                Key::D => { if !g.mv(0, 1) { g.lock(); } g.score += 1; }
+                Key::U => g.rot(),
                 Key::Hold => g.hold(),
-                _ => {}
+                Key::Other | Key::Quit | Key::Pause => {}
             },
             _ => {}
         }
-        if paused {
-            write!(out, "{}", g.render(true)).unwrap();
-            out.flush().unwrap();
-            continue;
+        if !paused {
+            if last.elapsed() >= dt {
+                if !g.mv(0, 1) { g.lock(); }
+                last = Instant::now();
+            }
         }
-        if last.elapsed() >= interval {
-            if !g.move_(0, 1) { g.lock(); }
-            last = Instant::now();
-        }
-        write!(out, "{}", g.render(false)).unwrap();
-        out.flush().unwrap();
+        write!(o, "{}", g.render(paused)).unwrap();
+        o.flush().unwrap();
     }
-    write!(out, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H").unwrap();
-    out.flush().unwrap();
+    write!(o, "\x1b[?25h\x1b[0m\x1b[2J\x1b[H").unwrap();
+    o.flush().unwrap();
     println!("Thanks for playing! Score: {}", g.score);
 }
